@@ -31,7 +31,8 @@ regex==2024.9.11
 ninja==1.11.1.1
 packaging==24.1
 flash-attn==2.6.3
-xformers==0.0.28.post1
+# Optional: speeds up SwiGLU (code has a PyTorch fallback)
+# xformers==0.0.28.post1
 rotary-emb==0.1
 dropout-layer-norm==0.1
 xentropy-cuda-lib==0.1
