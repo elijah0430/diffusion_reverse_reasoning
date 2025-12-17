@@ -11,7 +11,7 @@ import torch.nn as nn
 from lightning_utilities.core.imports import RequirementCache
 from typing_extensions import Self
 from lit_gpt.config import Config
-from xformers.ops import SwiGLU
+from lit_gpt.swiglu import SwiGLU
 from .fused_rotary_embedding import apply_rotary_emb_func
 RoPECache = Tuple[torch.Tensor, torch.Tensor]
 KVCache = Tuple[torch.Tensor, torch.Tensor]
