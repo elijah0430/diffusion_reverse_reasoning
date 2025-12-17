@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Training artifacts
+out/
+workdir/
+
+# Large checkpoints / downloaded weights
+models/
+*.safetensors
+*.pth
+
+# Downloaded datasets / generated evaluation outputs
+data/gsm8k/
+data/reverse_experiments/
+data/*/model_answer/
+data/*/model_judgment/
+data/ShareGPT*.json
