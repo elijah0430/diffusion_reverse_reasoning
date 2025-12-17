@@ -2,6 +2,7 @@ import time
 from collections import deque
 from contextlib import nullcontext
 from typing import Any, Callable, Deque, Dict, Optional
+import warnings
 
 import torch
 from lightning import Callback, Fabric, LightningModule, Trainer
@@ -94,13 +95,27 @@ def get_flops_available(device: torch.device, precision: str) -> Optional[float]
             device_name = None
 
         if device_name is not None:
-            try:
-                return int(GPU_AVAILABLE_FLOPS[device_name][precision])
-            except KeyError:
-                raise KeyError(
-                    f"flop count not found for {device_name} with precision: {precision}; "
-                    "MFU cannot be calculated and reported."
-                )
+            flops_by_precision = GPU_AVAILABLE_FLOPS[device_name]
+            if precision in flops_by_precision:
+                return int(flops_by_precision[precision])
+
+            fallback_precisions = []
+            if precision.startswith("bf16"):
+                fallback_precisions.append(precision.replace("bf16", "16", 1))
+            if precision.endswith("-mixed"):
+                fallback_precisions.append(precision.replace("-mixed", "-true", 1))
+            elif precision.endswith("-true"):
+                fallback_precisions.append(precision.replace("-true", "-mixed", 1))
+
+            for fallback in fallback_precisions:
+                if fallback in flops_by_precision:
+                    return int(flops_by_precision[fallback])
+
+            warnings.warn(
+                f"FLOPs table missing entry for device={device_name!r} precision={precision!r}; "
+                "MFU will not be reported."
+            )
+            return None
     elif device.type == "xla":
         from torch_xla.experimental import tpu
 
