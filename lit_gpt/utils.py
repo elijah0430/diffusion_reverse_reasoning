@@ -500,6 +500,12 @@ def get_default_supported_precision(training: bool, tpu: bool = False) -> str:
     """
     if tpu:
         return "32-true"
-    if not torch.cuda.is_available() or torch.cuda.is_bf16_supported():
+    if not torch.cuda.is_available():
         return "bf16-mixed" if training else "bf16-true"
+    if torch.cuda.is_bf16_supported():
+        # Guard against environments that mis-report bf16 support on pre-Ampere GPUs (e.g. V100).
+        # bf16 tensor cores are available on Ampere (SM8x) and newer.
+        major, _minor = torch.cuda.get_device_capability()
+        if major >= 8:
+            return "bf16-mixed" if training else "bf16-true"
     return "16-mixed" if training else "16-true"
