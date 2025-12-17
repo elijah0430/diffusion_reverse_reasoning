@@ -10,7 +10,6 @@ import torch
 import torch.nn as nn
 from lightning_utilities.core.imports import RequirementCache
 from typing_extensions import Self
-from flash_attn import flash_attn_func
 from lit_gpt.config import Config
 from xformers.ops import SwiGLU
 from .fused_rotary_embedding import apply_rotary_emb_func
@@ -254,14 +253,24 @@ class CausalSelfAttention(nn.Module):
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ):
         scale = 1.0 / math.sqrt(self.config.head_size)
-        
-        assert (
+        if (
             FlashAttention2Available
             and q.device.type == "cuda"
             and q.dtype in (torch.float16, torch.bfloat16)
-        )
+        ):
+            from flash_attn import flash_attn_func
 
-        return flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=scale, causal=True)
+            return flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=scale, causal=True)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        if q.size() != k.size():
+            k = k.repeat_interleave(q.shape[1] // k.shape[1], dim=1)
+            v = v.repeat_interleave(q.shape[1] // v.shape[1], dim=1)
+        y = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, dropout_p=0.0, scale=scale, is_causal=True
+        )
+        return y.transpose(1, 2)
 
 
 class GptNeoxMLP(nn.Module):

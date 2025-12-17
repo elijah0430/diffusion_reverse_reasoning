@@ -3,7 +3,10 @@
 import math
 from typing import Optional, Tuple
 
-import rotary_emb
+try:
+    import rotary_emb
+except Exception:  # pragma: no cover
+    rotary_emb = None
 import torch
 from einops import rearrange, repeat
 
@@ -36,6 +39,7 @@ class ApplyRotaryEmb(torch.autograd.Function):
                 if not interleaved
                 else (out_ro[..., ::2], out_ro[..., 1::2])
             )
+        assert rotary_emb is not None, "rotary_emb is required for the fused rotary embedding path"
         rotary_emb.apply_rotary(
             x1,
             x2,
@@ -73,6 +77,7 @@ class ApplyRotaryEmb(torch.autograd.Function):
                 if not ctx.interleaved
                 else (dx_ro[..., ::2], dx_ro[..., 1::2])
             )
+        assert rotary_emb is not None, "rotary_emb is required for the fused rotary embedding path"
         rotary_emb.apply_rotary(
             do1,
             do2,
@@ -86,6 +91,45 @@ class ApplyRotaryEmb(torch.autograd.Function):
             dx[..., rotary_dim:].copy_(do[..., rotary_dim:])
         return dx, None, None, None, None
 
+def _apply_rotary_emb_fallback(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    interleaved: bool = False,
+    inplace: bool = False,
+) -> torch.Tensor:
+    batch, seqlen, nheads, headdim = x.shape
+    rotary_seqlen, rotary_dim_half = cos.shape
+    rotary_dim = rotary_dim_half * 2
+    assert rotary_dim <= headdim
+    assert seqlen <= rotary_seqlen
 
-apply_rotary_emb_func = ApplyRotaryEmb.apply
+    x_ro = x[..., :rotary_dim]
+    x_pass = x[..., rotary_dim:]
+    cos_ = rearrange(cos[:seqlen], "s d -> 1 s 1 d")
+    sin_ = rearrange(sin[:seqlen], "s d -> 1 s 1 d")
 
+    if not interleaved:
+        x1, x2 = x_ro.chunk(2, dim=-1)
+        out1 = x1 * cos_ - x2 * sin_
+        out2 = x1 * sin_ + x2 * cos_
+        out_ro = torch.cat((out1, out2), dim=-1)
+    else:
+        x1 = x_ro[..., ::2]
+        x2 = x_ro[..., 1::2]
+        out1 = x1 * cos_ - x2 * sin_
+        out2 = x1 * sin_ + x2 * cos_
+        out_ro = torch.empty_like(x_ro)
+        out_ro[..., ::2] = out1
+        out_ro[..., 1::2] = out2
+
+    if inplace:
+        x_out = x.clone()
+        x_out[..., :rotary_dim] = out_ro
+        return x_out
+    if rotary_dim < headdim:
+        return torch.cat((out_ro, x_pass), dim=-1)
+    return out_ro
+
+
+apply_rotary_emb_func = ApplyRotaryEmb.apply if rotary_emb is not None else _apply_rotary_emb_fallback

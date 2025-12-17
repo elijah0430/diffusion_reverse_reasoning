@@ -22,7 +22,10 @@ from lit_gpt.speed_monitor import SpeedMonitorFabric as Monitor
 from lit_gpt.speed_monitor import estimate_flops, measure_flops
 from lit_gpt.utils import chunked_cross_entropy, get_default_supported_precision, num_parameters, step_csv_logger, lazy_load
 from pytorch_lightning.loggers import WandbLogger
-from flash_attn.losses.cross_entropy import CrossEntropyLoss
+try:
+    from flash_attn.losses.cross_entropy import CrossEntropyLoss
+except ModuleNotFoundError:  # pragma: no cover
+    from torch.nn import CrossEntropyLoss
 from reverse_data import preprocess_reverse_train
 from transformers import AutoTokenizer
 import random

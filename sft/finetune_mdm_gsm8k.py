@@ -4,6 +4,7 @@ import math
 import re
 import sys
 import time
+import os
 from pathlib import Path
 from typing import Optional, Tuple, Union
 import math
@@ -22,8 +23,11 @@ from lit_gpt.speed_monitor import SpeedMonitorFabric as Monitor
 from lit_gpt.speed_monitor import estimate_flops, measure_flops
 from lit_gpt.utils import chunked_cross_entropy, get_default_supported_precision, num_parameters, step_csv_logger, lazy_load
 from pytorch_lightning.loggers import WandbLogger
-from flash_attn.losses.cross_entropy import CrossEntropyLoss
-from gsm8k_data import preprocess_gsm8k
+try:
+    from flash_attn.losses.cross_entropy import CrossEntropyLoss
+except ModuleNotFoundError:  # pragma: no cover
+    from torch.nn import CrossEntropyLoss
+from gsm8k_data import preprocess_gsm8k, preprocess_gsm8k_prefix_infill_question
 from transformers import AutoTokenizer
 import random
 import argparse
@@ -35,8 +39,22 @@ def parse_args():
     parse.add_argument('--model', type=int, help='model parameters')
     parse.add_argument('--bs', type=int, default=256, help='batch size')
     parse.add_argument('--epoch', type=int, default=40, help='training epoch')
+    parse.add_argument(
+        '--max_steps',
+        type=int,
+        default=None,
+        help='Override the number of optimizer steps (useful for a short/toy run).',
+    )
     parse.add_argument('--pretrain_path', type=str, help='pretrain ckpt path')
     parse.add_argument('--nodes_num', type=int, default=1, help='number of devices')
+    parse.add_argument(
+        '--objective',
+        type=str,
+        default='answer',
+        choices=['answer', 'prefix_infill_question'],
+        help='SFT objective: standard answer prediction, or question-prefix infilling conditioned on CoT+answer.',
+    )
+    parse.add_argument('--seq_len', type=int, default=256, help='sequence length used for SFT')
     args = parse.parse_args()
     return args
 
@@ -45,11 +63,11 @@ model_name = f'Diff_LLaMA_{args.model}M'  # config
 out_dir = Path('workdir')
 
 # Hyperparameters
-num_of_devices = 8
-global_batch_size = int(args.bs / args.nodes_num)
+world_size = int(os.environ.get("WORLD_SIZE", "1"))
+global_batch_size = args.bs
 learning_rate = 2e-4
 micro_batch_size = 16
-max_step = int(769240 * args.epoch / args.bs)
+max_step = args.max_steps if args.max_steps is not None else int(769240 * args.epoch / args.bs)
 warmup_steps = int(max_step * 0.01)
 log_step_interval = 10
 save_step_interval = 5000
@@ -61,9 +79,10 @@ grad_clip = 1.0
 decay_lr = True
 min_lr = learning_rate / 10
 
-batch_size = global_batch_size // num_of_devices
+batch_size = global_batch_size // world_size
 gradient_accumulation_steps = batch_size // micro_batch_size
 assert gradient_accumulation_steps > 0
+warmup_steps = max(1, warmup_steps) if max_step > 0 else 0
 warmup_iters = warmup_steps * gradient_accumulation_steps
 
 
@@ -96,7 +115,6 @@ def extract_number(filename):
 
 
 def setup(
-    devices: int = 8,
     precision: Optional[str] = None,
     tpu: bool = False,
     resume: Union[bool, Path] = True,
@@ -109,10 +127,10 @@ def setup(
 
     precision = precision or get_default_supported_precision(training=True, tpu=tpu)
 
-    if devices > 1:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size > 1:
         if tpu:
             # For multi-host TPU training, the device count for Fabric is limited to the count on a single host.
-            devices = "auto"
             strategy = XLAStrategy(sync_module_states=False)
         else:
             strategy = FSDPStrategy(
@@ -125,7 +143,7 @@ def setup(
     else:
         strategy = "auto"
 
-    fabric = L.Fabric(devices=devices, strategy=strategy, precision=precision, loggers=[logger, wandb_logger])
+    fabric = L.Fabric(strategy=strategy, precision=precision, loggers=[logger, wandb_logger])
     fabric.print(hparams)
     #fabric.launch(main, train_data_dir, val_data_dir, resume)
     main(fabric, pretrain_path, resume)
@@ -142,7 +160,14 @@ def main(fabric, pretrain_path, resume):
     tokenizer = AutoTokenizer.from_pretrained('TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T',
                                               padding_side="right", use_fast=True)
 
-    train_set = preprocess_gsm8k(tokenizer, max_length=256)
+    if args.objective == 'answer':
+        train_set = preprocess_gsm8k(tokenizer, max_length=args.seq_len)
+    elif args.objective == 'prefix_infill_question':
+        train_set = preprocess_gsm8k_prefix_infill_question(
+            tokenizer, max_length=2048, pad_to_length=args.seq_len
+        )
+    else:
+        raise ValueError(f"Unknown objective: {args.objective}")
 
     fabric.seed_everything(3407)  # same seed for every process to init model (FSDP)
     train_dataloader = DataLoader(train_set, batch_size=micro_batch_size, shuffle=True, drop_last=True,
@@ -244,22 +269,35 @@ def train(fabric, state, train_dataloader, monitor, resume):
 
         iter_t0 = time.perf_counter()
         input_ids = train_data['data'] # [prompt + answer + padding], length=2048
-        prompt_length = train_data['input_length']  # prompt length
-        max_length = 256
+        max_length = args.seq_len
         input_ids = input_ids[:, :max_length]
 
         total_dim = 32000
         noisy_input, p_mask = forward_process(input_ids, total_dim=total_dim)
-        temp_tensor = torch.arange(noisy_input.size(1), device=noisy_input.device).expand(noisy_input.size(0), noisy_input.size(1))
-        prompt_index = (temp_tensor < prompt_length.unsqueeze(1))
-        noisy_input[prompt_index] = input_ids[prompt_index].clone()
+
+        if 'condition_mask' in train_data:
+            condition_mask = train_data['condition_mask'][:, :max_length].to(torch.bool)
+            loss_mask = train_data['loss_mask'][:, :max_length].to(torch.bool)
+        else:
+            prompt_length = train_data['input_length']  # prompt length
+            token_positions = torch.arange(noisy_input.size(1), device=noisy_input.device).expand(
+                noisy_input.size(0), noisy_input.size(1)
+            )
+            condition_mask = token_positions < prompt_length.unsqueeze(1)
+            loss_mask = ~condition_mask
+
+        noisy_input[condition_mask] = input_ids[condition_mask].clone()
         mask_indices = (noisy_input == total_dim)
+        compute_mask = mask_indices & loss_mask
 
         is_accumulating = (state["iter_num"] + 1) % gradient_accumulation_steps != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             logits = model(noisy_input)
-            loss = loss_func(logits[mask_indices], input_ids[mask_indices]) / p_mask[mask_indices]
-            loss = loss.sum() / (input_ids.shape[0] * max_length - prompt_length.sum())
+            if compute_mask.any():
+                token_loss = loss_func(logits[compute_mask], input_ids[compute_mask]) / p_mask[compute_mask]
+                loss = token_loss.sum() / loss_mask.sum()
+            else:
+                loss = logits.sum() * 0.0
             # loss = chunked_cross_entropy(logits, targets, chunk_size=0)
             fabric.backward(loss / gradient_accumulation_steps)
 
@@ -302,10 +340,12 @@ def train(fabric, state, train_dataloader, monitor, resume):
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
-    if it < warmup_iters:
+    if warmup_iters > 0 and it < warmup_iters:
         return learning_rate * it / warmup_iters
     # 2) if it > lr_decay_iters, return min learning rate
     if it > lr_decay_iters:
+        return min_lr
+    if lr_decay_iters <= warmup_iters:
         return min_lr
     # 3) in between, use cosine decay down to min learning rate
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
