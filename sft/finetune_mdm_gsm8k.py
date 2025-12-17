@@ -38,6 +38,7 @@ def parse_args():
     parse = argparse.ArgumentParser()
     parse.add_argument('--model', type=int, help='model parameters')
     parse.add_argument('--bs', type=int, default=256, help='batch size')
+    parse.add_argument('--micro_bs', type=int, default=16, help='micro batch size per GPU')
     parse.add_argument('--epoch', type=int, default=40, help='training epoch')
     parse.add_argument(
         '--max_steps',
@@ -66,7 +67,7 @@ out_dir = Path('workdir')
 world_size = int(os.environ.get("WORLD_SIZE", "1"))
 global_batch_size = args.bs
 learning_rate = 2e-4
-micro_batch_size = 16
+micro_batch_size = args.micro_bs
 max_step = args.max_steps if args.max_steps is not None else int(769240 * args.epoch / args.bs)
 warmup_steps = int(max_step * 0.01)
 log_step_interval = 10
