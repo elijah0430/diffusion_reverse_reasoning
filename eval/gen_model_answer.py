@@ -30,6 +30,15 @@ from lit_gpt.diffmodel import TransEncoder
 from safetensors.torch import load_file
 
 
+def _get_cuda_amp_dtype() -> torch.dtype:
+    # bf16 tensor cores are available on Ampere (SM8x) and newer.
+    if torch.cuda.is_available():
+        major, _minor = torch.cuda.get_device_capability()
+        if major >= 8:
+            return torch.bfloat16
+    return torch.float16
+
+
 def add_gumbel_noise(logits, temperature):
     '''
     As suggested by https://arxiv.org/pdf/2409.02908, we use float64 for the gumbel max method.
@@ -57,9 +66,10 @@ def ar_sample_kvcache(gpt, tokenizer, prompt, temperature=1., context_length=204
     gpt.reset_cache()
 
     prev_pos = 0
+    amp_dtype = _get_cuda_amp_dtype() if device.startswith("cuda") else torch.float32
     for cur_pos in range(prompt.shape[1], context_length):
         input_pos = torch.arange(cur_pos, dtype=torch.long, device=device)
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        with torch.cuda.amp.autocast(dtype=amp_dtype):
             logits = gpt(prompt[:, prev_pos:cur_pos], input_pos=input_pos)[:, -1]
 
         logits_with_noise = add_gumbel_noise(logits, temperature)
@@ -80,9 +90,10 @@ def diff_sample(model, tokenizer, prompt=None, batch_size=1, alg='origin', steps
     x[:, :prompt.shape[1]] = prompt.clone()
 
     timesteps = torch.linspace(1, eps, steps + 1, device='cuda')
+    amp_dtype = _get_cuda_amp_dtype() if device.startswith("cuda") else torch.float32
     for i in range(steps):
         mask_index = (x == dim)
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        with torch.cuda.amp.autocast(dtype=amp_dtype):
             if cfg_scale > 0.:
                 un_x = x.clone()
                 un_x[:, :prompt.shape[1]] = dim
@@ -143,9 +154,10 @@ def diff_sample_infill(
     condition_mask = condition_mask.to(device).to(torch.bool)
 
     timesteps = torch.linspace(1, eps, steps + 1, device=device)
+    amp_dtype = _get_cuda_amp_dtype() if str(device).startswith("cuda") else torch.float32
     for i in range(steps):
         mask_index = (x == dim)
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        with torch.cuda.amp.autocast(dtype=amp_dtype):
             if cfg_scale > 0.0:
                 un_x = x.clone()
                 un_x[condition_mask] = dim
