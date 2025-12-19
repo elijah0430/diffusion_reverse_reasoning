@@ -260,13 +260,15 @@ def main() -> None:
     total = 0
     skipped = 0
     exact = 0
+    token_correct = 0
+    token_total = 0
 
     batch_x: List[torch.Tensor] = []
     batch_cond: List[torch.Tensor] = []
     batch_meta: List[Dict[str, object]] = []
 
     def flush_batch() -> None:
-        nonlocal total, exact
+        nonlocal total, exact, token_correct, token_total
         if not batch_x:
             return
         x = torch.stack(batch_x, dim=0)
@@ -285,13 +287,19 @@ def main() -> None:
         for i, meta in enumerate(batch_meta):
             q_len = int(meta["q_len"])
             gt_question = str(meta["gt_question"])
+            gt_ids = torch.tensor(meta["gt_ids"], dtype=torch.long)
             pred_question = tokenizer.decode(out[i, :q_len].tolist(), skip_special_tokens=True)
 
             total += 1
+            pred_ids = out[i, :q_len].detach().cpu().to(torch.long)
+            token_correct += int((pred_ids == gt_ids).sum().item())
+            token_total += int(gt_ids.numel())
             if _strip_question_prefix(pred_question) == _strip_question_prefix(gt_question):
                 exact += 1
 
             print(f"[{total}] EM={exact}/{total} ({exact/total:.3f}) q_len={q_len}")
+            if token_total:
+                print(f"TokAcc={token_correct}/{token_total} ({token_correct/token_total:.3f})")
             print("GT:", gt_question)
             print("PR:", pred_question)
             if args.show_condition:
@@ -340,6 +348,7 @@ def main() -> None:
                 "gt_question": gt_question,
                 "condition": _normalize_text(thought + " " + answer),
                 "q_len": q_len,
+                "gt_ids": q_ids[:q_len].tolist(),
             }
         )
 
@@ -354,6 +363,7 @@ def main() -> None:
     if skipped:
         print(f"Skipped {skipped} examples due to length constraints.")
     print(f"Final normalized exact match: {exact}/{total} ({(exact/total) if total else 0.0:.3f})")
+    print(f"Final token accuracy (question tokens): {token_correct}/{token_total} ({(token_correct/token_total) if token_total else 0.0:.3f})")
 
 
 if __name__ == "__main__":
