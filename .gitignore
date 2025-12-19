@@ -13,6 +13,8 @@ models/
 
 # Downloaded datasets / generated evaluation outputs
 # data/gsm8k/
+data/gsm8k/test.txt
+data/gsm8k/test.jsonl
 # data/reverse_experiments/
 # data/*/model_answer/
 # data/*/model_judgment/
