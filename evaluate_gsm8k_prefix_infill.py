@@ -189,6 +189,11 @@ def load_model_state_dict(ckpt_path: Path) -> Dict[str, torch.Tensor]:
         else:
             state_dict = ckpt
 
+        # Materialize tensors while the zipfile is still open. `lazy_load` returns `NotYetLoadedTensor` objects
+        # that require an open file handle; if we exit the context before materialization, `load_state_dict`
+        # will fail with `'NoneType' object has no attribute 'get_storage_from_record'`.
+        state_dict = {k: v.contiguous() for k, v in state_dict.items()}
+
     for prefix in ("module.", "_forward_module.", "model."):
         state_dict = _strip_state_dict_prefix(state_dict, prefix)
     return state_dict
@@ -353,4 +358,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
